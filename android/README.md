@@ -31,6 +31,49 @@ Windows Android Studio <--USB ADB--> phone (Termux + socat) <--Wi-Fi--> Control 
    and runs `adb connect 127.0.0.1:15555`.
 4. Select `127.0.0.1:15555` in **Android Studio** and press **Run** repeatedly.
 
+## Android mobile data routing
+
+Some phones (including the Sonim XP3plus 5G) can stay connected to the Control
+Hub's Wi-Fi but send traffic to `192.168.43.1` over **cellular data** instead,
+because the robot's Wi-Fi has no internet. This causes timeouts even when
+`adb devices` can see the phone and the USB port forward exists.
+
+If `adb connect 127.0.0.1:15555` times out, check the route **from Windows
+PowerShell** (nothing needs to be typed on the phone):
+
+```powershell
+$adb = "$env:LOCALAPPDATA\Android\Sdk\platform-tools\adb.exe"
+& $adb devices                 # identify the USB phone's serial
+& $adb -s PHONE_SERIAL shell ip route get 192.168.43.1
+```
+
+Replace `PHONE_SERIAL` with the phone serial shown by `adb devices`.
+The route should say `dev wlan0` and use an address like `192.168.43.x`.
+If it says `dev rmnet_data...`, Android is trying to use cellular instead.
+
+**Only if needed**, temporarily turn off the phone's mobile data:
+
+```powershell
+& $adb -s PHONE_SERIAL shell svc data disable
+& $adb -s PHONE_SERIAL shell ip route get 192.168.43.1
+& $adb connect 127.0.0.1:15555
+```
+
+This disables **cellular internet data on the phone**, not the laptop's
+internet. Ordinary cellular voice calls and SMS should continue to work;
+Wi-Fi calling and MMS can depend on the carrier and connection. The
+`connect.ps1` script does **not** change mobile data automatically.
+
+**Restore mobile data when finished**:
+
+```powershell
+& $adb -s PHONE_SERIAL shell svc data enable
+```
+
+If `dev wlan0` is shown but the robot still times out, check that the Control
+Hub is powered on, the phone joined its Wi-Fi, and Termux's `socat` relay is
+running.
+
 ## Logs and dashboards
 
 ```powershell
@@ -61,9 +104,8 @@ Panels' Limelight proxy may also require forwarding ports `5800`, `5801`,
   Then rerun the Windows script (the running relay remains active).
 - If the relay is running but the robot is off, launching again may type into
   the busy terminal. Stop socat with Ctrl+C before relaunching, or restart Termux.
-- If Android routes Termux traffic through mobile data instead of robot Wi-Fi,
-  temporarily disable mobile data while developing. Cellular voice calls normally still work.
 - The robot Wi-Fi must be connected for real deployments. The relay can start
   while the robot is powered off, but `adb connect` will not work yet.
-- The phone-to-robot network and Limelight/telemetry paths are not yet tested
-  end-to-end on the Sonim XP3plus 5G. Verify on a robot before relying on it.
+- The Sonim XP3plus 5G has successfully reached a REV Control Hub through this
+  USB-to-Wi-Fi ADB bridge. Actual app deployment and Panels/Limelight streaming
+  still need separate testing.
