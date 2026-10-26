@@ -1,7 +1,8 @@
 #!/bin/bash
 # Manage the robots (Control Hubs) this Pi knows. The Mac app and the `ftc-bridge` command
 # run this over SSH, as root via sudo:
-#   ftc-hub status        ->  robot=<name>, ssid=<wifi>, hub=up|down, and one saved=<name><TAB><wifi> per robot
+#   ftc-hub status        ->  robot=<name>, ssid=<wifi>, hub=up|down (ping), adbd=up|down (a real ADB
+#                             handshake: the robot is ready for uploads), one saved=<name><TAB><wifi> per robot
 #   ftc-hub scan          ->  nearby Wi-Fi names, one per line
 #   ftc-hub list          ->  saved robots, one <name><TAB><wifi> per line
 #   ftc-hub add NAME      ->  saves a robot; reads its Wi-Fi name, then password, from stdin (one per line)
@@ -22,6 +23,33 @@ wifi_on() {  # Raspberry Pi OS starts with Wi-Fi switched off in NetworkManager
   rfkill unblock wifi 2>/dev/null || true
   nmcli radio wifi on
 }
+# A real ADB handshake: send ADB's CNXN hello and wait for adbd's reply (CNXN, or AUTH when it
+# wants a key). A ping or an open port doesn't prove adbd answers: right after the robot boots it
+# accepts connections for a while without replying. Prints "CNXN 12" / "AUTH 12" (reply, ms) or "none".
+adb_hello() {
+  python3 - "$1" "${2:-5555}" "${3:-2}" <<'PY'
+import socket, struct, sys, time
+host, port, timeout = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+payload = b"host::\0"
+cnxn = 0x4E584E43  # "CNXN"
+hello = struct.pack("<6I", cnxn, 0x01000001, 4096, len(payload), sum(payload), cnxn ^ 0xFFFFFFFF) + payload
+start = time.monotonic()
+try:
+    with socket.create_connection((host, port), timeout=timeout) as s:
+        s.settimeout(timeout)
+        s.sendall(hello)
+        head = b""
+        while len(head) < 24:
+            chunk = s.recv(24 - len(head))
+            if not chunk:
+                break
+            head += chunk
+    reply = head[:4].decode("ascii", "replace") if len(head) == 24 else ""
+    print(f"{reply} {round((time.monotonic() - start) * 1000)}" if reply in ("CNXN", "AUTH") else "none")
+except OSError:
+    print("none")
+PY
+}
 check_name() {
   [[ "$1" =~ ^[A-Za-z0-9._-]{1,32}$ ]] ||
     { echo "Robot names can use letters, numbers, . _ - (up to 32)"; exit 1; }
@@ -37,7 +65,13 @@ case "${1:-}" in
     ROBOT="$(nmcli -t -g NAME con show --active | sed -n "s/^$PREFIX//p" | head -1)"
     echo "robot=$ROBOT"
     echo "ssid=$([[ -n "$ROBOT" ]] && ssid_of "$ROBOT" || true)"
-    if ping -c1 -W1 "$HUB_IP" >/dev/null 2>&1; then echo "hub=up"; else echo "hub=down"; fi
+    if ping -c1 -W1 "$HUB_IP" >/dev/null 2>&1; then
+      echo "hub=up"
+      read -r reply ms <<<"$(adb_hello "$HUB_IP" 5555 1.5)"
+      if [[ "$reply" == CNXN || "$reply" == AUTH ]]; then echo "adbd=up"; echo "adbd_ms=$ms"; else echo "adbd=down"; fi
+    else
+      echo "hub=down"; echo "adbd=down"
+    fi
     for r in $(saved); do printf 'saved=%s\t%s\n' "$r" "$(ssid_of "$r")"; done
     ;;
   scan)
@@ -84,10 +118,20 @@ case "${1:-}" in
   health)
     ROBOT="$(nmcli -t -g NAME con show --active | sed -n "s/^$PREFIX//p" | head -1)"
     echo "robot=$ROBOT"
+    echo "pi_uptime_s=$(cut -d' ' -f1 /proc/uptime | cut -d. -f1)"
+    echo "forwarder=$(systemctl is-active adb-forward 2>/dev/null || true)"
+    echo "linkwatch=$(systemctl is-active ftc-linkwatch 2>/dev/null || true)"
+    # The Wi-Fi the Pi is really on, to compare with the robot it's set to.
+    [[ -n "$ROBOT" ]] && echo "wifi_expected=$(ssid_of "$ROBOT")"
+    echo "wifi_actual=$(nmcli -t -f ACTIVE,SSID dev wifi 2>/dev/null | sed -n 's/^yes://p' | sed 's/\\:/:/g' | head -1)"
     # The connected network's signal (0-100), frequency, channel and link rate.
     nmcli -t -f IN-USE,SIGNAL,FREQ,CHAN,RATE dev wifi list --rescan no 2>/dev/null |
       awk -F: '$1=="*" {print "signal="$2; print "freq="$3; print "channel="$4; print "rate="$5; exit}'
+    PING_MS="$(ping -c1 -W1 "$HUB_IP" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\).*/\1/p')"
+    echo "hub_ping_ms=${PING_MS:-none}"
     if nc -z -w 2 "$HUB_IP" 5555 2>/dev/null; then echo "adb_port=open"; else echo "adb_port=closed"; fi
+    read -r reply ms <<<"$(adb_hello "$HUB_IP" 5555 3)"
+    echo "adbd_reply=${reply:-none}"; [[ "$reply" == CNXN || "$reply" == AUTH ]] && echo "adbd_ms=$ms"
     # The Robot Controller app's own status page. (It also holds the Wi-Fi password: never print it.)
     INFO="$(python3 - "$HUB_IP" <<'PY'
 import json, sys, urllib.request

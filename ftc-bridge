@@ -95,12 +95,14 @@ installed_pi_version() {
 }
 
 status() {
-  local s robot ssid hub
+  local s robot ssid hub adbd
   s="$(pi status)"
-  robot="$(field robot <<<"$s")"; ssid="$(field ssid <<<"$s")"; hub="$(field hub <<<"$s")"
+  robot="$(field robot <<<"$s")"; ssid="$(field ssid <<<"$s")"; hub="$(field hub <<<"$s")"; adbd="$(field adbd <<<"$s")"
+  # "Ready" only when the robot's ADB answered a real handshake; a ping alone can't promise uploads work.
   if [[ -z "$robot" ]]; then echo "Pi plugged in, no robot chosen (ftc-bridge use NAME)"; return 1
-  elif [[ "$hub" == up ]]; then echo "Connected to $robot ($ssid), hub reachable"
-  else echo "Set to $robot ($ssid), but the hub isn't answering. Is the robot on?"; return 1
+  elif [[ "$adbd" == up ]]; then echo "Connected to $robot ($ssid): ready for uploads (ADB answered in $(field adbd_ms <<<"$s") ms)"
+  elif [[ "$hub" == up ]]; then echo "Set to $robot ($ssid): the robot is on, but its ADB isn't answering yet (just started? wait a minute)"; return 1
+  else echo "Set to $robot ($ssid), but the robot isn't answering. Is it on?"; return 1
   fi
 }
 
@@ -202,43 +204,137 @@ case "${1:-}" in
     ;;
   test) gradle :TeamCode:testDebugUnitTest ;;
   health)
-    H="$(pi health)"
-    ok=1
-    robot="$(field robot <<<"$H")"
-    [[ -n "$robot" ]] || { echo "No robot chosen (ftc-bridge use NAME)"; exit 1; }
-    echo "Robot:     $robot"
-    if [[ -n "$(field signal <<<"$H")" ]]; then
-      echo "Wi-Fi:     signal $(field signal <<<"$H")/100, $(field freq <<<"$H") (channel $(field channel <<<"$H")), $(field rate <<<"$H")"
+    # Every link from this Mac to the robot, each with a real round trip, so "ready" can't be a guess:
+    # USB -> the Pi answers -> Pi software -> robot Wi-Fi -> hub on the network -> right hub ->
+    # robot app -> the robot's ADB answers a handshake -> the same through the Pi from this Mac -> adb here.
+    if [[ -t 1 ]]; then G=$'\033[32m'; R=$'\033[31m'; Y=$'\033[33m'; D=$'\033[2m'; N=$'\033[0m'; else G= R= Y= D= N=; fi
+    FIX=""
+    pass() { printf '  %s✓%s %-22s %s\n' "$G" "$N" "$1" "$2"; }
+    warn() { printf '  %s!%s %-22s %s\n' "$Y" "$N" "$1" "$2"; }
+    fail() { printf '  %s✗%s %-22s %s\n' "$R" "$N" "$1" "$2"; [[ -n "$FIX" ]] || FIX="$3"; }
+    skip() { printf '  %s–%s %-22s %s\n' "$D" "$N" "$1" "${D}not checked: an earlier step failed${N}"; }
+    ms() { perl -MTime::HiRes=time -e 'printf "%d", time*1000'; }
+    verdict() {
+      if [[ -z "$FIX" ]]; then echo; echo "${G}READY${N}: code uploads will work."; exit 0; fi
+      echo; echo "${R}NOT READY${N}: $FIX"; exit 1
+    }
+
+    t="$(ping -c1 -t2 "${PI#*@}" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\).*/\1/p' || true)"  # no reply is a result, not an error
+    if [[ -n "$t" ]]; then pass "USB link to the Pi" "answers in ${t%.*} ms"
     else
-      echo "Wi-Fi:     not connected to the robot's Wi-Fi. Is the robot on?"; ok=0
+      # Tell apart: not plugged in / plugged in but macOS made no network link / link up but no reply.
+      if ! ioreg -p IOUSB -l -w0 2>/dev/null | grep -q '"USB Product Name" = "Raspberry Pi USB Gadget"'; then
+        fail "USB link to the Pi" "the Pi isn't plugged in (or is still starting)" "plug the Pi into this Mac (its middle USB port, not PWR) and wait 45 s."
+      elif ! ifconfig 2>/dev/null | grep -q 'inet 10\.12\.194\.'; then
+        fail "USB link to the Pi" "the Mac sees the Pi on USB but has no network link to it" "macOS's side of the link is stuck: unplug the Pi's cable for 5 s and plug it back in."
+      else
+        fail "USB link to the Pi" "the network link is up but the Pi doesn't reply" "the Pi may be restarting: wait 30 s. If it stays this way, unplug it for 5 s."
+      fi
+      for step in "Pi answers" "Pi software" "Robot Wi-Fi" "Robot on the network" "Right robot" "Robot app" "Robot's ADB" "ADB through the Pi" "adb on this Mac"; do skip "$step"; done
+      verdict
     fi
-    if [[ "$(field rc_app <<<"$H")" == up ]]; then
-      echo "Robot app: running (SDK $(field sdkVersion <<<"$H"), config \"$(field activeConfigName <<<"$H")\", hub Wi-Fi $(field hubChannel <<<"$H"))"
-    else
-      echo "Robot app: not answering (is the Robot Controller app running?)"; ok=0
+
+    t0="$(ms)"; H="$(ssh "${SSH_OPTS[@]}" "$PI" sudo /usr/local/bin/ftc-hub health 2>/dev/null)" || H=""
+    t1="$(ms)"
+    if [[ -z "$H" ]]; then
+      fail "Pi answers" "pings, but doesn't answer commands" "the Pi is stuck: ftc-bridge reboot, or unplug it for 5 s."
+      for step in "Pi software" "Robot Wi-Fi" "Robot on the network" "Right robot" "Robot app" "Robot's ADB" "ADB through the Pi" "adb on this Mac"; do skip "$step"; done
+      verdict
     fi
+    up="$(field pi_uptime_s <<<"$H")"; up="${up:-0}"
+    since="up $((up / 3600)) h $((up % 3600 / 60)) min"
+    if (( up < 300 )); then warn "Pi answers" "in $((t1 - t0)) ms, but it restarted $((up / 60)) min ago"
+    else pass "Pi answers" "in $((t1 - t0)) ms, $since"; fi
+
+    fwd="$(field forwarder <<<"$H")"; latest="$(latest_pi_version)"
+    installed="$(ssh "${SSH_OPTS[@]}" "$PI" 'cat /etc/ftc-pi-bridge/version 2>/dev/null || echo none' 2>/dev/null || true)"
+    if [[ "$fwd" != active ]]; then fail "Pi software" "the upload forwarder isn't running" "ftc-bridge update-pi (reinstalls it), then ftc-bridge reboot if needed."
+    elif [[ "$installed" != "$latest" ]]; then warn "Pi software" "works, but is older than this Mac's copy (ftc-bridge update-pi)"
+    else pass "Pi software" "up to date, forwarder running"; fi
+
+    robot="$(field robot <<<"$H")"; want="$(field wifi_expected <<<"$H")"; have="$(field wifi_actual <<<"$H")"
+    sig="$(field signal <<<"$H")"; freq="$(field freq <<<"$H")"; chan="$(field channel <<<"$H")"
+    band=""; [[ "$freq" == 2* ]] && band="2.4 GHz"; [[ "$freq" == 5* ]] && band="5 GHz"
+    if [[ -z "$robot" ]]; then
+      fail "Robot Wi-Fi" "no robot chosen" "pick one: ftc-bridge use NAME (ftc-bridge robots lists them)."
+    elif [[ -z "$have" ]]; then
+      fail "Robot Wi-Fi" "the Pi isn't on $robot's Wi-Fi ($want)" "turn the robot on; if it is on, run ftc-bridge use $robot (and check its hub is on 2.4 GHz)."
+    elif [[ "$have" != "$want" ]]; then
+      fail "Robot Wi-Fi" "on \"$have\", not $robot's \"$want\"" "ftc-bridge use $robot"
+    elif (( ${sig:-0} < 40 )); then warn "Robot Wi-Fi" "$robot ($have), weak signal ${sig}% ${band:+· $band }ch $chan: move closer"
+    else pass "Robot Wi-Fi" "$robot ($have), signal ${sig}% ${band:+· $band }ch $chan"; fi
+
+    pms="$(field hub_ping_ms <<<"$H")"
+    if [[ -n "$robot" && -n "$have" && "$pms" != none && -n "$pms" ]]; then pass "Robot on the network" "the hub answers in ${pms%.*} ms"
+    elif [[ -z "$robot" || -z "$have" ]]; then skip "Robot on the network"
+    else fail "Robot on the network" "the hub doesn't answer" "the robot may be off or just starting; wait 30 s."; fi
+
     serial="$(field serialNumber <<<"$H")"
     case "$(field same_hub <<<"$H")" in
-      yes) echo "Hub:       $serial, the same hub as before" ;;
-      first_time) echo "Hub:       $serial, saved as $robot's hub" ;;
-      no) echo "Hub:       $serial, a DIFFERENT hub than $robot had before ($(field saved_serial <<<"$H")). Check you're on the right robot."; ok=0 ;;
+      yes) pass "Right robot" "same hub as before ($serial)" ;;
+      first_time) pass "Right robot" "first time: hub $serial saved as $robot's" ;;
+      no) fail "Right robot" "hub $serial is NOT the hub $robot had before ($(field saved_serial <<<"$H"))" "this may be a different robot. If $robot really got a new hub, re-save it: ftc-bridge add $robot WIFI_NAME." ;;
+      *) if [[ -n "$have" ]]; then warn "Right robot" "can't tell yet (the robot app isn't answering)"; else skip "Right robot"; fi ;;
     esac
-    if [[ "$(field adb_port <<<"$H")" == open ]]; then
-      "$ADB" disconnect "$ADB_SERIAL" >/dev/null 2>&1 || true
-      if "$ADB" connect "$ADB_SERIAL" | grep -q 'connected to'; then
-        adb_serial="$("$ADB" -s "$ADB_SERIAL" shell getprop ro.serialno 2>/dev/null | tr -d '\r')"
-        if [[ -n "$serial" && "$adb_serial" != "$serial" ]]; then
-          echo "adb:       connected, but to hub $adb_serial, not $serial"; ok=0
-        else
-          echo "adb:       connected${adb_serial:+ to hub $adb_serial}"
-        fi
+
+    if [[ "$(field rc_app <<<"$H")" == up ]]; then
+      pass "Robot app" "running, SDK $(field sdkVersion <<<"$H"), config \"$(field activeConfigName <<<"$H")\""
+    elif [[ -n "$have" ]]; then fail "Robot app" "the Robot Controller app isn't answering" "restart the robot (or the Robot Controller app) and wait 30 s."
+    else skip "Robot app"; fi
+
+    reply="$(field adbd_reply <<<"$H")"; adbms="$(field adbd_ms <<<"$H")"
+    if [[ "$reply" == CNXN ]]; then pass "Robot's ADB" "answers a handshake in ${adbms} ms"
+    elif [[ "$reply" == AUTH ]]; then warn "Robot's ADB" "answers, but wants this computer's key approved"
+    elif [[ -z "$have" ]]; then skip "Robot's ADB"
+    elif [[ "$(field adb_port <<<"$H")" == open ]]; then fail "Robot's ADB" "its port is open but it doesn't reply" "the robot just started or ADB is stuck: wait a minute, then restart the robot if it stays this way."
+    else fail "Robot's ADB" "closed" "the robot's ADB is off: restart the robot."; fi
+
+    # The same handshake from this Mac, through the Pi's forwarder. /usr/bin/python3 is Apple's, which
+    # macOS's Local Network privacy doesn't block, so this tests the path, not app permissions.
+    py=/usr/bin/python3; [[ -x "$py" ]] || py=python3
+    if [[ "$reply" == CNXN || "$reply" == AUTH ]]; then
+      r2="$("$py" - "${PI#*@}" 5555 4 <<'PY'
+import socket, struct, sys, time
+host, port, timeout = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
+payload = b"host::\0"
+cnxn = 0x4E584E43
+hello = struct.pack("<6I", cnxn, 0x01000001, 4096, len(payload), sum(payload), cnxn ^ 0xFFFFFFFF) + payload
+start = time.monotonic()
+try:
+    with socket.create_connection((host, port), timeout=timeout) as s:
+        s.settimeout(timeout); s.sendall(hello); head = b""
+        while len(head) < 24:
+            chunk = s.recv(24 - len(head))
+            if not chunk: break
+            head += chunk
+    reply = head[:4].decode("ascii", "replace") if len(head) == 24 else ""
+    print(f"{reply} {round((time.monotonic() - start) * 1000)}" if reply in ("CNXN", "AUTH") else "none")
+except OSError:
+    print("none")
+PY
+)"
+      if [[ "$r2" == CNXN* || "$r2" == AUTH* ]]; then pass "ADB through the Pi" "this Mac reaches the robot's ADB in ${r2#* } ms"
+      else fail "ADB through the Pi" "the robot answers the Pi, but not through it" "the Pi's forwarder is stuck: ftc-bridge reboot."; fi
+    else skip "ADB through the Pi"; fi
+
+    # Last, the real adb on this Mac: a command that has to reach the robot and come back.
+    if [[ "$r2" == CNXN* || "$r2" == AUTH* ]]; then
+      if [[ ! -x "$ADB" ]]; then fail "adb on this Mac" "adb isn't installed" "install Android Studio (it includes adb)."
       else
-        echo "adb:       the robot's adb port is open but adb couldn't connect"; ok=0
+        [[ "$("$ADB" -s "$ADB_SERIAL" get-state 2>/dev/null)" == device ]] || "$ADB" connect "$ADB_SERIAL" >/dev/null 2>&1 || true
+        echo_out="$(perl -e 'alarm shift; exec @ARGV' 8 "$ADB" -s "$ADB_SERIAL" shell echo ftc-ok 2>&1 | tr -d '\r' || true)"
+        if [[ "$echo_out" == ftc-ok ]]; then
+          adb_serial="$(perl -e 'alarm shift; exec @ARGV' 8 "$ADB" -s "$ADB_SERIAL" shell getprop ro.serialno 2>/dev/null | tr -d '\r' || true)"
+          if [[ -n "$serial" && -n "$adb_serial" && "$adb_serial" != "$serial" ]]; then
+            fail "adb on this Mac" "talks to hub $adb_serial, not $serial" "adb is on an old connection: ftc-bridge use $robot (it reconnects adb)."
+          else pass "adb on this Mac" "runs commands on the robot${adb_serial:+ (hub $adb_serial)}"; fi
+        elif [[ "$echo_out" == *unauthorized* ]]; then fail "adb on this Mac" "the robot hasn't approved this computer" "connect the hub by USB-C once and accept, or check its ADB settings."
+        elif [[ "$echo_out" == *"No route to host"* || "$echo_out" == *"failed to connect"* ]]; then
+          fail "adb on this Mac" "adb can't reach the robot, but the path works" "macOS is blocking adb (Local Network privacy): allow the app that runs it in System Settings > Privacy & Security > Local Network."
+        else fail "adb on this Mac" "no answer${echo_out:+ ($echo_out)}" "adb is stuck on an old connection: ftc-bridge use $robot (reconnects it)."; fi
       fi
-    else
-      echo "adb:       not reachable (robot off, or its adb is off)"; ok=0
-    fi
-    [[ $ok == 1 ]] || exit 1
+    else skip "adb on this Mac"; fi
+    verdict
     ;;
   key)
     if [[ ! -f "$HOME/.ssh/ftcpi" ]]; then

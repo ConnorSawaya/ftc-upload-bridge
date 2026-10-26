@@ -6,7 +6,7 @@ import SwiftUI
 import UserNotifications
 
 /// Runs a program and returns whether it succeeded and what it printed. `input` goes to its stdin.
-func execute(_ path: String, _ args: [String], input: String? = nil) async -> (ok: Bool, output: String) {
+func execute(_ path: String, _ args: [String], input: String? = nil, timeout: TimeInterval? = nil) async -> (ok: Bool, output: String) {
     await withCheckedContinuation { done in
         DispatchQueue.global().async {
             let process = Process()
@@ -17,6 +17,9 @@ func execute(_ path: String, _ args: [String], input: String? = nil) async -> (o
             process.standardError = stdout
             process.standardInput = stdin
             do { try process.run() } catch { return done.resume(returning: (false, "\(error)")) }
+            if let timeout {
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout) { if process.isRunning { process.terminate() } }
+            }
             if let input { stdin.fileHandleForWriting.write(Data(input.utf8)) }
             try? stdin.fileHandleForWriting.close()
             let data = stdout.fileHandleForReading.readDataToEndOfFile()
@@ -97,9 +100,9 @@ enum ADB {
         "/usr/local/bin/adb",
     ].first { FileManager.default.isExecutableFile(atPath: $0) }
 
-    static func run(_ args: [String]) async -> (ok: Bool, output: String) {
+    static func run(_ args: [String], timeout: TimeInterval = 20) async -> (ok: Bool, output: String) {
         guard let path else { return (false, "adb not found. Install Android Studio (it includes adb).") }
-        return await execute(path, args)
+        return await execute(path, args, timeout: timeout)
     }
 
     /// Fresh connection to whichever robot the Pi is on now (drops a stale one to the last robot).
@@ -108,8 +111,10 @@ enum ADB {
         return await run(["connect", serial]).output.contains("connected to")
     }
 
-    static func isConnected() async -> Bool {
-        await run(["-s", serial, "get-state"]).output == "device"
+    /// True only if a command really runs on the robot and comes back. (`adb get-state` can say
+    /// "device" long after the connection silently died.)
+    static func answers() async -> Bool {
+        await run(["-s", serial, "shell", "echo", "ftc-ok"], timeout: 6).output == "ftc-ok"
     }
 }
 
@@ -180,8 +185,17 @@ struct Health {
     var sdk = ""
     var hubSerial = ""
     var sameHub = ""           // yes, first_time or no
-    var adb = false
+    var adb = false            // a command really ran on the robot from this Mac
     var adbSerial = ""
+    var adbdReply = ""         // the robot's ADB answer to a handshake from the Pi: CNXN, AUTH or none
+    var adbdMs = ""
+    var piUptime = 0           // seconds
+    var forwarder = false
+    var wifiExpected = ""
+    var wifiActual = ""
+
+    var adbdAnswers: Bool { adbdReply == "CNXN" || adbdReply == "AUTH" }
+    var wrongWifi: Bool { !wifiActual.isEmpty && !wifiExpected.isEmpty && wifiActual != wifiExpected }
 
     var band: String { freq.hasPrefix("5") ? "5 GHz" : freq.hasPrefix("2") ? "2.4 GHz" : "" }
     var rightRobot: Bool { sameHub != "no" && (adbSerial.isEmpty || hubSerial.isEmpty || adbSerial == hubSerial) }
@@ -228,6 +242,7 @@ final class Bridge: ObservableObject {
     enum Link { case noPi, noHub, connected }
 
     @Published var link = Link.noPi
+    @Published var hubOnline = false   // the hub answers a ping (the robot is on), whether or not ADB is ready
     @Published var robot = ""          // robot the Pi is set to
     @Published var ssid = ""           // that robot's Wi-Fi name
     @Published var robots: [Robot] = []
@@ -294,8 +309,9 @@ final class Bridge: ObservableObject {
 
     var subtitle: String {
         switch link {
-        case .connected: "Connected · \(ssid)"
-        case .noHub: robot.isEmpty ? "Pick or add a robot below" : "Not answering. Is the robot on?"
+        case .connected: "Ready for uploads · \(ssid)"
+        case .noHub: robot.isEmpty ? "Pick or add a robot below"
+            : hubOnline ? "Robot is on, but its ADB isn't answering yet" : "Not answering. Is the robot on?"
         case .noPi: "Plug the Pi's middle USB port into this Mac"
         }
     }
@@ -319,14 +335,15 @@ final class Bridge: ObservableObject {
             robots = saved
             robot = fields["robot"] ?? ""
             ssid = fields["ssid"] ?? ""
-            link = fields["hub"] == "up" ? .connected : .noHub
+            hubOnline = fields["hub"] == "up"
+            link = fields["adbd"] == "up" ? .connected : .noHub
         } else {
             link = .noPi
         }
         if before == .noPi && link != .noPi { checkPiVersionSoon = true }  // just plugged in
         // Keep adb connected to the robot so it shows up in Android Studio by itself.
         if link == .connected && UserDefaults.standard.bool(forKey: Prefs.autoADB) && ADB.path != nil {
-            let stillConnected = adbRobot == robot ? await ADB.isConnected() : false
+            let stillConnected = adbRobot == robot ? await ADB.answers() : false
             if !stillConnected {
                 adbRobot = await ADB.connect() ? robot : ""
             }
@@ -422,7 +439,13 @@ final class Bridge: ObservableObject {
         h.sdk = f["sdkVersion"] ?? ""
         h.hubSerial = f["serialNumber"] ?? ""
         h.sameHub = f["same_hub"] ?? ""
-        if f["adb_port"] == "open" && ADB.path != nil, await ADB.isConnected() {
+        h.adbdReply = f["adbd_reply"] ?? ""
+        h.adbdMs = f["adbd_ms"] ?? ""
+        h.piUptime = Int(f["pi_uptime_s"] ?? "") ?? 0
+        h.forwarder = f["forwarder"] == "active"
+        h.wifiExpected = f["wifi_expected"] ?? ""
+        h.wifiActual = f["wifi_actual"] ?? ""
+        if h.adbdAnswers && ADB.path != nil, await ADB.answers() {
             h.adb = true
             h.adbSerial = await ADB.run(["-s", ADB.serial, "shell", "getprop", "ro.serialno"]).output
         }
@@ -504,7 +527,7 @@ final class Bridge: ObservableObject {
         messageIsError = false
         message = "Opening Panels…"
         defer { busy = false }
-        if !(await ADB.isConnected()) {
+        if !(await ADB.answers()) {
             guard await ADB.connect() else {
                 return showError(ADB.path == nil ? "adb not found. Install Android Studio (it includes adb)." : "Couldn't reach the robot. Is it on?")
             }
@@ -759,14 +782,22 @@ struct Panel: View {
         VStack(alignment: .leading, spacing: 3) {
             SectionTitle(text: "HEALTH")
             if let h = bridge.health {
+                HealthRow(icon: "cpu", label: "Pi",
+                          value: !h.forwarder ? "Forwarder stopped"
+                              : h.piUptime < 300 ? "Restarted \(h.piUptime / 60) min ago" : "Up \(h.piUptime / 3600) h \(h.piUptime % 3600 / 60) min",
+                          good: h.forwarder && h.piUptime >= 300)
                 HealthRow(icon: "wifi", label: "Wi-Fi",
-                          value: h.signal.map { "\($0)%" + (h.band.isEmpty ? "" : " · \(h.band)") + (h.channel.isEmpty ? "" : " ch \(h.channel)") } ?? "Not connected",
-                          good: (h.signal ?? 0) >= 40)
+                          value: h.wrongWifi ? "On \(h.wifiActual), not \(h.wifiExpected)"
+                              : h.signal.map { "\($0)%" + (h.band.isEmpty ? "" : " · \(h.band)") + (h.channel.isEmpty ? "" : " ch \(h.channel)") } ?? "Not connected",
+                          good: !h.wrongWifi && (h.signal ?? 0) >= 40)
                 HealthRow(icon: "app.badge.checkmark", label: "Robot app",
                           value: h.robotApp ? "Running" + (h.sdk.isEmpty ? "" : " · SDK \(h.sdk)") : "Not answering",
                           good: h.robotApp)
-                HealthRow(icon: "cable.connector", label: "adb",
-                          value: h.adb ? "Connected" : "Not connected", good: h.adb)
+                HealthRow(icon: "bolt.horizontal", label: "Robot's ADB",
+                          value: h.adbdReply == "CNXN" ? "Answers (\(h.adbdMs) ms)" : h.adbdReply == "AUTH" ? "Wants a key" : "Not answering",
+                          good: h.adbdReply == "CNXN")
+                HealthRow(icon: "cable.connector", label: "adb on this Mac",
+                          value: h.adb ? "Runs commands" : h.adbdAnswers ? "Blocked or stale" : "Waiting for the robot", good: h.adb)
                 HealthRow(icon: "checkmark.shield", label: "Right robot",
                           value: !h.rightRobot ? "Different hub!" : h.sameHub == "first_time" ? "Hub saved" : h.hubSerial.isEmpty ? "Unknown" : "Same hub",
                           good: h.rightRobot && !h.hubSerial.isEmpty)
@@ -934,7 +965,7 @@ struct Panel: View {
     // MARK: Settings page
 
     private var version: String {
-        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.5"
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.6"
     }
 
     @ViewBuilder private var settingsPage: some View {
