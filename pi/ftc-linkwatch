@@ -10,12 +10,13 @@
 # The computer is the newest DHCP lease on usb0. Once the computer has answered, if it stops answering for
 # DEAD_AFTER seconds while it's still plugged in and awake (USB "configured", not "suspended" or "not
 # attached"), the link is dead, carrier or not. Then, in order, until the computer answers again:
-#   1. re-plug in software: unbind the USB controller, wait OFF_S seconds, bind it again, so the computer
-#      sees the cable pulled and put back while the Pi keeps its power;
+#   1. re-plug in software: let go of the USB data line for OFF_S seconds (soft_connect), so the computer
+#      sees the cable pulled and put back while the Pi keeps running;
 #   2. after RETRY_AFTER seconds without an answer, re-plug again, unplugged longer (TRIES re-plugs in all);
 #   3. still nothing: restart the Pi. That's what pulling the cable does (the whole Pi, its USB controller
-#      included, starts over), and pulling the cable has always brought it back. A re-plug alone sometimes
-#      hasn't: twice the Mac didn't bring its network back after one.
+#      included, starts over), and pulling the cable has always brought it back.
+# (Until 2026-10-26 the re-plug unbound the USB controller driver instead. That crashed the Pi every time, so
+# the watchdog restarted it; four of those in a row left the Mac's side stuck until the cable was pulled.)
 # It does this once per loss: it acts again only after the computer has answered again, so an unplugged or
 # sleeping computer never makes it loop. Everything goes to the journal as "ftc-linkwatch", saved to the card
 # at once (a power cut can't lose it); `ftc-hub links` (ftc-bridge pi-log) counts it.
@@ -29,13 +30,18 @@ RETRY_AFTER=30
 TRIES=2
 OFF_S=5                                     # how long the first re-plug stays unplugged (more the next time)
 LEASES=/var/lib/NetworkManager/dnsmasq-$IF.leases
-DRV=/sys/bus/platform/drivers/dwc2
 
 log() { logger -t ftc-linkwatch -- "$*"; journalctl --sync 2>/dev/null; }   # (on the card now)
 udc() { ls /sys/class/udc 2>/dev/null | head -n 1; }
 usb_state() { local u; u="$(udc)"; cat "/sys/class/udc/$u/state" 2>/dev/null || echo none; }
 carrier() { cat "/sys/class/net/$IF/carrier" 2>/dev/null || echo -; }
-computer() { [ -r "$LEASES" ] && sort -rn "$LEASES" | awk 'NR == 1 { print $3 }'; }
+computer() {   # the computer's lease (by its fixed address from install.sh), else the newest lease
+  [ -r "$LEASES" ] || return 0
+  local mac ip=""; mac="$(cat /sys/module/g_ether/parameters/host_addr 2>/dev/null)"
+  [ -n "$mac" ] && ip="$(awk -v m="$mac" 'tolower($2) == tolower(m) { print $3; exit }' "$LEASES")"
+  [ -n "$ip" ] || ip="$(sort -rn "$LEASES" | awk 'NR == 1 { print $3 }')"
+  echo "$ip"
+}
 count() { local v; v="$(cat "/sys/class/net/$IF/statistics/$1" 2>/dev/null)"; echo "${v:-0}"; }
 answers() {
   [ -n "$1" ] && [ -e "/sys/class/net/$IF" ] || return 1
@@ -46,13 +52,9 @@ replug() {   # $1: seconds to stay unplugged
   if [ "${FTC_LINKWATCH_TEST_NOREPLUG:-}" = 1 ]; then log "(test: not re-plugging)"; return 0; fi
   local u; u="$(udc)"
   [ -n "$u" ] || { log "can't re-plug: no USB controller found"; return 1; }
-  echo "$u" > "$DRV/unbind" 2>/dev/null
+  echo disconnect > "/sys/class/udc/$u/soft_connect" 2>/dev/null
   sleep "$1"
-  echo "$u" > "$DRV/bind" 2>/dev/null
-  # (the USB gadget driver binds to the controller again by itself; if usb0 doesn't come back, reload it)
-  for _ in $(seq 1 10); do [ -e "/sys/class/net/$IF" ] && return 0; sleep 1; done
-  log "usb0 didn't come back after the re-plug: reloading the USB gadget driver"
-  modprobe -r g_ether 2>/dev/null; sleep 1; modprobe g_ether
+  echo connect > "/sys/class/udc/$u/soft_connect" 2>/dev/null
 }
 
 log "watching the USB link: a check every ${PERIOD} s; dead after ${DEAD_AFTER} s without an answer:" \

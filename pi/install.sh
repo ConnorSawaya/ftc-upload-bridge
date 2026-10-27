@@ -14,6 +14,14 @@ install -m 0644 ftc-linkwatch.service /etc/systemd/system/ftc-linkwatch.service
 install -D -m 0644 watchdog.conf /etc/systemd/system.conf.d/watchdog.conf  # auto-restart if frozen
 install -D -m 0644 journald.conf /etc/systemd/journald.conf.d/ftc-persistent.conf  # keep logs across restarts
 install -D -m 0644 wifi-powersave.conf /etc/NetworkManager/conf.d/ftc-wifi-powersave.conf
+# The same network adapter on the computer every boot: g_ether otherwise makes up new addresses each boot,
+# and the Mac then sets up yet another adapter. Locally administered addresses from the Pi's serial number;
+# they apply from the next boot.
+SERIAL="$(tr -d '\0' < /proc/device-tree/serial-number 2>/dev/null | tail -c 8)"
+if [[ "$SERIAL" =~ ^[0-9a-fA-F]{8}$ ]]; then
+  M="${SERIAL:0:2}:${SERIAL:2:2}:${SERIAL:4:2}:${SERIAL:6:2}"
+  echo "options g_ether host_addr=02:f7:$M dev_addr=02:f6:$M" > /etc/modprobe.d/ftc-usb-mac.conf
+fi
 mkdir -p /var/log/journal
 systemctl restart systemd-journald
 journalctl --flush 2>/dev/null || true  # move this boot's log from memory onto the card

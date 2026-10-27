@@ -336,7 +336,11 @@ final class Bridge: ObservableObject {
             robot = fields["robot"] ?? ""
             ssid = fields["ssid"] ?? ""
             hubOnline = fields["hub"] == "up"
-            link = fields["adbd"] == "up" ? .connected : .noHub
+            // The robot's ADB answers one connection at a time: while adb here is connected, the Pi's
+            // handshake gets no reply. Then a command through that adb session is the proof.
+            var ready = fields["adbd"] == "up"
+            if !ready && hubOnline && ADB.path != nil { ready = await ADB.answers() }
+            link = ready ? .connected : .noHub
         } else {
             link = .noPi
         }
@@ -445,7 +449,7 @@ final class Bridge: ObservableObject {
         h.forwarder = f["forwarder"] == "active"
         h.wifiExpected = f["wifi_expected"] ?? ""
         h.wifiActual = f["wifi_actual"] ?? ""
-        if h.adbdAnswers && ADB.path != nil, await ADB.answers() {
+        if ADB.path != nil, h.adbdAnswers || h.robotApp, await ADB.answers() {
             h.adb = true
             h.adbSerial = await ADB.run(["-s", ADB.serial, "shell", "getprop", "ro.serialno"]).output
         }
@@ -794,8 +798,9 @@ struct Panel: View {
                           value: h.robotApp ? "Running" + (h.sdk.isEmpty ? "" : " · SDK \(h.sdk)") : "Not answering",
                           good: h.robotApp)
                 HealthRow(icon: "bolt.horizontal", label: "Robot's ADB",
-                          value: h.adbdReply == "CNXN" ? "Answers (\(h.adbdMs) ms)" : h.adbdReply == "AUTH" ? "Wants a key" : "Not answering",
-                          good: h.adbdReply == "CNXN")
+                          value: h.adbdReply == "CNXN" ? "Answers (\(h.adbdMs) ms)" : h.adb ? "In use by this Mac's adb"
+                              : h.adbdReply == "AUTH" ? "Wants a key" : "Not answering",
+                          good: h.adbdReply == "CNXN" || h.adb)
                 HealthRow(icon: "cable.connector", label: "adb on this Mac",
                           value: h.adb ? "Runs commands" : h.adbdAnswers ? "Blocked or stale" : "Waiting for the robot", good: h.adb)
                 HealthRow(icon: "checkmark.shield", label: "Right robot",

@@ -94,6 +94,13 @@ installed_pi_version() {
     die "can't reach the Pi. Is it plugged into this Mac?"
 }
 
+# The robot's ADB answers one connection at a time: while adb here is connected, a handshake from the
+# Pi gets no reply. So when that adb session is up, a command through it is the proof instead.
+mac_adb_works() {
+  [[ "$("$ADB" -s "$ADB_SERIAL" get-state 2>/dev/null)" == device ]] &&
+    [[ "$(perl -e 'alarm shift; exec @ARGV' 8 "$ADB" -s "$ADB_SERIAL" shell echo ftc-ok 2>/dev/null | tr -d '\r')" == ftc-ok ]]
+}
+
 status() {
   local s robot ssid hub adbd
   s="$(pi status)"
@@ -101,6 +108,7 @@ status() {
   # "Ready" only when the robot's ADB answered a real handshake; a ping alone can't promise uploads work.
   if [[ -z "$robot" ]]; then echo "Pi plugged in, no robot chosen (ftc-bridge use NAME)"; return 1
   elif [[ "$adbd" == up ]]; then echo "Connected to $robot ($ssid): ready for uploads (ADB answered in $(field adbd_ms <<<"$s") ms)"
+  elif [[ "$hub" == up ]] && mac_adb_works; then echo "Connected to $robot ($ssid): ready for uploads (this Mac's adb is connected and runs commands)"
   elif [[ "$hub" == up ]]; then echo "Set to $robot ($ssid): the robot is on, but its ADB isn't answering yet (just started? wait a minute)"; return 1
   else echo "Set to $robot ($ssid), but the robot isn't answering. Is it on?"; return 1
   fi
@@ -234,8 +242,10 @@ case "${1:-}" in
       verdict
     fi
 
-    t0="$(ms)"; H="$(ssh "${SSH_OPTS[@]}" "$PI" sudo /usr/local/bin/ftc-hub health 2>/dev/null)" || H=""
+    # Timed on a quick command: the health one waits on the robot's checks too.
+    t0="$(ms)"; installed="$(ssh "${SSH_OPTS[@]}" "$PI" 'cat /etc/ftc-pi-bridge/version 2>/dev/null || echo none' 2>/dev/null || true)"
     t1="$(ms)"
+    H=""; [[ -z "$installed" ]] || H="$(ssh "${SSH_OPTS[@]}" "$PI" sudo /usr/local/bin/ftc-hub health 2>/dev/null)" || H=""
     if [[ -z "$H" ]]; then
       fail "Pi answers" "pings, but doesn't answer commands" "the Pi is stuck: ftc-bridge reboot, or unplug it for 5 s."
       for step in "Pi software" "Robot Wi-Fi" "Robot on the network" "Right robot" "Robot app" "Robot's ADB" "ADB through the Pi" "adb on this Mac"; do skip "$step"; done
@@ -247,7 +257,6 @@ case "${1:-}" in
     else pass "Pi answers" "in $((t1 - t0)) ms, $since"; fi
 
     fwd="$(field forwarder <<<"$H")"; latest="$(latest_pi_version)"
-    installed="$(ssh "${SSH_OPTS[@]}" "$PI" 'cat /etc/ftc-pi-bridge/version 2>/dev/null || echo none' 2>/dev/null || true)"
     if [[ "$fwd" != active ]]; then fail "Pi software" "the upload forwarder isn't running" "ftc-bridge update-pi (reinstalls it), then ftc-bridge reboot if needed."
     elif [[ "$installed" != "$latest" ]]; then warn "Pi software" "works, but is older than this Mac's copy (ftc-bridge update-pi)"
     else pass "Pi software" "up to date, forwarder running"; fi
@@ -286,13 +295,16 @@ case "${1:-}" in
     if [[ "$reply" == CNXN ]]; then pass "Robot's ADB" "answers a handshake in ${adbms} ms"
     elif [[ "$reply" == AUTH ]]; then warn "Robot's ADB" "answers, but wants this computer's key approved"
     elif [[ -z "$have" ]]; then skip "Robot's ADB"
+    elif mac_adb_works; then pass "Robot's ADB" "busy with this Mac's adb session, which runs commands"; reply=MAC
     elif [[ "$(field adb_port <<<"$H")" == open ]]; then fail "Robot's ADB" "its port is open but it doesn't reply" "the robot just started or ADB is stuck: wait a minute, then restart the robot if it stays this way."
     else fail "Robot's ADB" "closed" "the robot's ADB is off: restart the robot."; fi
 
     # The same handshake from this Mac, through the Pi's forwarder. /usr/bin/python3 is Apple's, which
     # macOS's Local Network privacy doesn't block, so this tests the path, not app permissions.
     py=/usr/bin/python3; [[ -x "$py" ]] || py=python3
-    if [[ "$reply" == CNXN || "$reply" == AUTH ]]; then
+    r2=""
+    if [[ "$reply" == MAC ]]; then r2=MAC; pass "ADB through the Pi" "this Mac's adb session runs through it"
+    elif [[ "$reply" == CNXN || "$reply" == AUTH ]]; then
       r2="$("$py" - "${PI#*@}" 5555 4 <<'PY'
 import socket, struct, sys, time
 host, port, timeout = sys.argv[1], int(sys.argv[2]), float(sys.argv[3])
@@ -314,11 +326,12 @@ except OSError:
 PY
 )"
       if [[ "$r2" == CNXN* || "$r2" == AUTH* ]]; then pass "ADB through the Pi" "this Mac reaches the robot's ADB in ${r2#* } ms"
+      elif mac_adb_works; then r2=MAC; pass "ADB through the Pi" "this Mac's adb session runs through it"
       else fail "ADB through the Pi" "the robot answers the Pi, but not through it" "the Pi's forwarder is stuck: ftc-bridge reboot."; fi
     else skip "ADB through the Pi"; fi
 
     # Last, the real adb on this Mac: a command that has to reach the robot and come back.
-    if [[ "$r2" == CNXN* || "$r2" == AUTH* ]]; then
+    if [[ "$r2" == CNXN* || "$r2" == AUTH* || "$r2" == MAC ]]; then
       if [[ ! -x "$ADB" ]]; then fail "adb on this Mac" "adb isn't installed" "install Android Studio (it includes adb)."
       else
         [[ "$("$ADB" -s "$ADB_SERIAL" get-state 2>/dev/null)" == device ]] || "$ADB" connect "$ADB_SERIAL" >/dev/null 2>&1 || true
