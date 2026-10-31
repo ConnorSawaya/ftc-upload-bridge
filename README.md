@@ -35,6 +35,9 @@ Teammates on Windows can use the Pi too, from a terminal and AI apps (there's no
 
 Don't turn on Internet Connection Sharing for the Pi.
 
+## Linux
+Linux computers can use the same Raspberry Pi USB bridge and `ftc-bridge` commands (CLI and MCP; no desktop app). Prepare the Pi SD card using Connor's macOS `flash.sh`, then on Linux run `bash linux/install.sh`. See [Linux setup](linux/README.md) for USB networking and SSH key authorization.
+
 ## Every time
 1. Plug in the Pi and turn on the robot. The menu bar icon shows radio waves when it's connected.
 2. In Android Studio, pick the Control Hub and press Run. The app connects adb for you (without the app: `adb connect 10.12.194.1:5555`).
