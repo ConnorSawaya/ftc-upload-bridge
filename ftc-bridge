@@ -56,20 +56,33 @@ SSH_OPTS=(-i "$HOME/.ssh/ftcpi" -o BatchMode=yes -o ConnectTimeout=3 -o LogLevel
   -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null)
 ADB_SERIAL="10.12.194.1:5555"
 RC_ACTIVITY="com.qualcomm.ftcrobotcontroller/org.firstinspires.ftc.robotcontroller.internal.PermissionValidatorWrapper"
-ADB="$(command -v adb || echo "$HOME/Library/Android/sdk/platform-tools/adb")"
+PLATFORM="$(uname -s)"
+if command -v adb >/dev/null 2>&1; then ADB="$(command -v adb)"
+elif [[ "$PLATFORM" == Darwin ]]; then ADB="$HOME/Library/Android/sdk/platform-tools/adb"
+else ADB="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-$HOME/Android/Sdk}}/platform-tools/adb"; fi
 STUDIO_JAVA="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
 # Panels: 8001 web page, 8002 live data (the page connects to <its own host>:8002);
 # 5800/5801/5805/5807: the Limelight, which the Panels Limelight plugin passes through the hub.
 PANELS_PORTS="8001 8002 5800 5801 5805 5807"
 TUNING_PORTS="10158 12649"   # Pedro Pathing AutoTune: its page, and the WebSocket the page opens on the same host
 APP="com.qualcomm.ftcrobotcontroller"
-BACKUPS="$HOME/Library/Application Support/ftc-pi-bridge/backups"
+if [[ "$PLATFORM" == Linux ]]; then
+  DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+  BACKUPS="$DATA_HOME/ftc-pi-bridge/backups"
+  DATA="$DATA_HOME/ftc-pi-bridge/data"
+else
+  BACKUPS="$HOME/Library/Application Support/ftc-pi-bridge/backups"
+  DATA="$HOME/Library/Application Support/ftc-pi-bridge/data"
+fi
 KEEP_BACKUPS=5
-DATA="$HOME/Library/Application Support/ftc-pi-bridge/data"   # runs pulled from the robot
 ROBOT_DATA="/sdcard/FIRST/bridge-data"                        # where BridgeLog.java writes them
 # What the FTC SDK and Android log when robot code throws, freezes or crashes the app.
 CRASH_PATTERN='User code threw an uncaught exception|User OpMode was stuck in|FATAL EXCEPTION'
-LOG_DIR="$HOME/Library/Logs/ftc-bridge"
+if [[ "$PLATFORM" == Linux ]]; then
+  LOG_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ftc-bridge"
+else
+  LOG_DIR="$HOME/Library/Logs/ftc-bridge"
+fi
 ROBOT_LOG="$LOG_DIR/robot.log"           # the recorder appends here; rotated to robot.log.1 at 20 MB
 RECORDER_PID="$LOG_DIR/recorder.pid"
 
@@ -86,9 +99,22 @@ pi() {
 }
 
 field() { sed -n "s/^$1=//p"; }
+sha256_stream() {
+  if [[ "$PLATFORM" == Darwin ]]; then shasum -a 256
+  else sha256sum; fi
+}
+file_size() {
+  if [[ "$PLATFORM" == Darwin ]]; then stat -f%z "$1"
+  else stat -c%s "$1"; fi
+}
+open_url() {
+  if [[ "$PLATFORM" == Darwin ]]; then open "$1"
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$1" >/dev/null 2>&1 || echo "Open $1 in your browser."
+  else echo "Open $1 in your browser."; fi
+}
 
 # The Pi software's version: a fingerprint of the files in pi/, so any change makes a new one.
-latest_pi_version() { (cd "$PI_FILES" && cat $(ls | sort) | shasum -a 256 | cut -c1-12); }
+latest_pi_version() { (cd "$PI_FILES" && cat $(ls | sort) | sha256_stream | cut -c1-12); }
 installed_pi_version() {
   ssh "${SSH_OPTS[@]}" "$PI" 'cat /etc/ftc-pi-bridge/version 2>/dev/null || echo none' ||
     die "can't reach the Pi. Is it plugged into this Mac?"
@@ -96,7 +122,7 @@ installed_pi_version() {
 
 # The robot's ADB answers one connection at a time: while adb here is connected, a handshake from the
 # Pi gets no reply. So when that adb session is up, a command through it is the proof instead.
-mac_adb_works() {
+host_adb_works() {
   [[ "$("$ADB" -s "$ADB_SERIAL" get-state 2>/dev/null)" == device ]] &&
     [[ "$(perl -e 'alarm shift; exec @ARGV' 8 "$ADB" -s "$ADB_SERIAL" shell echo ftc-ok 2>/dev/null | tr -d '\r')" == ftc-ok ]]
 }
@@ -108,7 +134,7 @@ status() {
   # "Ready" only when the robot's ADB answered a real handshake; a ping alone can't promise uploads work.
   if [[ -z "$robot" ]]; then echo "Pi plugged in, no robot chosen (ftc-bridge use NAME)"; return 1
   elif [[ "$adbd" == up ]]; then echo "Connected to $robot ($ssid): ready for uploads (ADB answered in $(field adbd_ms <<<"$s") ms)"
-  elif [[ "$hub" == up ]] && mac_adb_works; then echo "Connected to $robot ($ssid): ready for uploads (this Mac's adb is connected and runs commands)"
+  elif [[ "$hub" == up ]] && host_adb_works; then echo "Connected to $robot ($ssid): ready for uploads (this Mac's adb is connected and runs commands)"
   elif [[ "$hub" == up ]]; then echo "Set to $robot ($ssid): the robot is on, but its ADB isn't answering yet (just started? wait a minute)"; return 1
   else echo "Set to $robot ($ssid), but the robot isn't answering. Is it on?"; return 1
   fi
@@ -146,7 +172,13 @@ mark_log() {
 gradle() {
   [[ -x ./gradlew ]] || die "run this from your robot project folder (the one with gradlew)"
   # Gradle needs a JDK; Android Studio ships one, and this Mac may have no other.
-  if [[ -z "${JAVA_HOME:-}" ]] && ! /usr/libexec/java_home >/dev/null 2>&1; then export JAVA_HOME="$STUDIO_JAVA"; fi
+  if [[ -z "${JAVA_HOME:-}" ]]; then
+    if [[ "$PLATFORM" == Darwin ]] && ! /usr/libexec/java_home >/dev/null 2>&1; then
+      export JAVA_HOME="$STUDIO_JAVA"
+    elif [[ "$PLATFORM" == Linux ]] && ! command -v java >/dev/null 2>&1 && [[ -d /opt/android-studio/jbr ]]; then
+      export JAVA_HOME=/opt/android-studio/jbr
+    fi
+  fi
   ./gradlew "$@"
 }
 
@@ -227,18 +259,25 @@ case "${1:-}" in
       echo; echo "${R}NOT READY${N}: $FIX"; exit 1
     }
 
-    t="$(ping -c1 -t2 "${PI#*@}" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\).*/\1/p' || true)"  # no reply is a result, not an error
+    if [[ "$PLATFORM" == Linux ]]; then PING_WAIT=(-W 2); else PING_WAIT=(-t 2); fi
+    t="$(ping -c1 "${PING_WAIT[@]}" "${PI#*@}" 2>/dev/null | sed -n 's/.*time=\([0-9.]*\).*/\1/p' || true)"  # no reply is a result, not an error
     if [[ -n "$t" ]]; then pass "USB link to the Pi" "answers in ${t%.*} ms"
     else
       # Tell apart: not plugged in / plugged in but macOS made no network link / link up but no reply.
-      if ! ioreg -p IOUSB -l -w0 2>/dev/null | grep -q '"USB Product Name" = "Raspberry Pi USB Gadget"'; then
+      if [[ "$PLATFORM" == Linux ]]; then
+        if ! ip -4 addr show 2>/dev/null | grep -q '10\.12\.194\.'; then
+          fail "USB link to the Pi" "Linux has no 10.12.194.x USB network address" "check ip addr and nmcli device; ensure the Pi's USB Ethernet interface uses automatic DHCP."
+        else
+          fail "USB link to the Pi" "the USB network is configured but the Pi doesn't reply" "check that the Pi is powered and its USB gadget is connected."
+        fi
+      elif ! ioreg -p IOUSB -l -w0 2>/dev/null | grep -q '"USB Product Name" = "Raspberry Pi USB Gadget"'; then
         fail "USB link to the Pi" "the Pi isn't plugged in (or is still starting)" "plug the Pi into this Mac (its middle USB port, not PWR) and wait 45 s."
       elif ! ifconfig 2>/dev/null | grep -q 'inet 10\.12\.194\.'; then
         fail "USB link to the Pi" "the Mac sees the Pi on USB but has no network link to it" "macOS's side of the link is stuck: unplug the Pi's cable for 5 s and plug it back in."
       else
         fail "USB link to the Pi" "the network link is up but the Pi doesn't reply" "the Pi may be restarting: wait 30 s. If it stays this way, unplug it for 5 s."
       fi
-      for step in "Pi answers" "Pi software" "Robot Wi-Fi" "Robot on the network" "Right robot" "Robot app" "Robot's ADB" "ADB through the Pi" "adb on this Mac"; do skip "$step"; done
+      for step in "Pi answers" "Pi software" "Robot Wi-Fi" "Robot on the network" "Right robot" "Robot app" "Robot's ADB" "ADB through the Pi" "adb on this computer"; do skip "$step"; done
       verdict
     fi
 
@@ -248,7 +287,7 @@ case "${1:-}" in
     H=""; [[ -z "$installed" ]] || H="$(ssh "${SSH_OPTS[@]}" "$PI" sudo /usr/local/bin/ftc-hub health 2>/dev/null)" || H=""
     if [[ -z "$H" ]]; then
       fail "Pi answers" "pings, but doesn't answer commands" "the Pi is stuck: ftc-bridge reboot, or unplug it for 5 s."
-      for step in "Pi software" "Robot Wi-Fi" "Robot on the network" "Right robot" "Robot app" "Robot's ADB" "ADB through the Pi" "adb on this Mac"; do skip "$step"; done
+      for step in "Pi software" "Robot Wi-Fi" "Robot on the network" "Right robot" "Robot app" "Robot's ADB" "ADB through the Pi" "adb on this computer"; do skip "$step"; done
       verdict
     fi
     up="$(field pi_uptime_s <<<"$H")"; up="${up:-0}"
@@ -295,7 +334,7 @@ case "${1:-}" in
     if [[ "$reply" == CNXN ]]; then pass "Robot's ADB" "answers a handshake in ${adbms} ms"
     elif [[ "$reply" == AUTH ]]; then warn "Robot's ADB" "answers, but wants this computer's key approved"
     elif [[ -z "$have" ]]; then skip "Robot's ADB"
-    elif mac_adb_works; then pass "Robot's ADB" "busy with this Mac's adb session, which runs commands"; reply=MAC
+    elif host_adb_works; then pass "Robot's ADB" "busy with this Mac's adb session, which runs commands"; reply=MAC
     elif [[ "$(field adb_port <<<"$H")" == open ]]; then fail "Robot's ADB" "its port is open but it doesn't reply" "the robot just started or ADB is stuck: wait a minute, then restart the robot if it stays this way."
     else fail "Robot's ADB" "closed" "the robot's ADB is off: restart the robot."; fi
 
@@ -326,27 +365,31 @@ except OSError:
 PY
 )"
       if [[ "$r2" == CNXN* || "$r2" == AUTH* ]]; then pass "ADB through the Pi" "this Mac reaches the robot's ADB in ${r2#* } ms"
-      elif mac_adb_works; then r2=MAC; pass "ADB through the Pi" "this Mac's adb session runs through it"
+      elif host_adb_works; then r2=MAC; pass "ADB through the Pi" "this Mac's adb session runs through it"
       else fail "ADB through the Pi" "the robot answers the Pi, but not through it" "the Pi's forwarder is stuck: ftc-bridge reboot."; fi
     else skip "ADB through the Pi"; fi
 
-    # Last, the real adb on this Mac: a command that has to reach the robot and come back.
+    # Last, the real adb on this computer: a command that has to reach the robot and come back.
     if [[ "$r2" == CNXN* || "$r2" == AUTH* || "$r2" == MAC ]]; then
-      if [[ ! -x "$ADB" ]]; then fail "adb on this Mac" "adb isn't installed" "install Android Studio (it includes adb)."
+      if [[ ! -x "$ADB" ]]; then fail "adb on this computer" "adb isn't installed" "install Android Studio (it includes adb)."
       else
         [[ "$("$ADB" -s "$ADB_SERIAL" get-state 2>/dev/null)" == device ]] || "$ADB" connect "$ADB_SERIAL" >/dev/null 2>&1 || true
         echo_out="$(perl -e 'alarm shift; exec @ARGV' 8 "$ADB" -s "$ADB_SERIAL" shell echo ftc-ok 2>&1 | tr -d '\r' || true)"
         if [[ "$echo_out" == ftc-ok ]]; then
           adb_serial="$(perl -e 'alarm shift; exec @ARGV' 8 "$ADB" -s "$ADB_SERIAL" shell getprop ro.serialno 2>/dev/null | tr -d '\r' || true)"
           if [[ -n "$serial" && -n "$adb_serial" && "$adb_serial" != "$serial" ]]; then
-            fail "adb on this Mac" "talks to hub $adb_serial, not $serial" "adb is on an old connection: ftc-bridge use $robot (it reconnects adb)."
-          else pass "adb on this Mac" "runs commands on the robot${adb_serial:+ (hub $adb_serial)}"; fi
-        elif [[ "$echo_out" == *unauthorized* ]]; then fail "adb on this Mac" "the robot hasn't approved this computer" "connect the hub by USB-C once and accept, or check its ADB settings."
+            fail "adb on this computer" "talks to hub $adb_serial, not $serial" "adb is on an old connection: ftc-bridge use $robot (it reconnects adb)."
+          else pass "adb on this computer" "runs commands on the robot${adb_serial:+ (hub $adb_serial)}"; fi
+        elif [[ "$echo_out" == *unauthorized* ]]; then fail "adb on this computer" "the robot hasn't approved this computer" "connect the hub by USB-C once and accept, or check its ADB settings."
         elif [[ "$echo_out" == *"No route to host"* || "$echo_out" == *"failed to connect"* ]]; then
-          fail "adb on this Mac" "adb can't reach the robot, but the path works" "macOS is blocking adb (Local Network privacy): allow the app that runs it in System Settings > Privacy & Security > Local Network."
-        else fail "adb on this Mac" "no answer${echo_out:+ ($echo_out)}" "adb is stuck on an old connection: ftc-bridge use $robot (reconnects it)."; fi
+          if [[ "$PLATFORM" == Darwin ]]; then
+            fail "adb on this computer" "adb can't reach the robot, but the path works" "macOS is blocking adb (Local Network privacy): allow the app that runs it in System Settings > Privacy & Security > Local Network."
+          else
+            fail "adb on this computer" "adb can't reach the robot, but the path works" "check the USB network address and local firewall."
+          fi
+        else fail "adb on this computer" "no answer${echo_out:+ ($echo_out)}" "adb is stuck on an old connection: ftc-bridge use $robot (reconnects it)."; fi
       fi
-    else skip "adb on this Mac"; fi
+    else skip "adb on this computer"; fi
     verdict
     ;;
   key)
@@ -383,7 +426,9 @@ PY
     latest="$(latest_pi_version)"
     # Copy pi/ over the USB link (without macOS's ._ metadata files) and run its install script
     # as root. Also set the Pi's clock: it has no internet to set it, so it drifts.
-    COPYFILE_DISABLE=1 tar --no-xattrs --no-mac-metadata -czf - -C "$PI_FILES" . | ssh "${SSH_OPTS[@]}" "$PI" \
+    tar_flags=()
+    [[ "$PLATFORM" == Darwin ]] && tar_flags=(--no-xattrs --no-mac-metadata)
+    COPYFILE_DISABLE=1 tar "${tar_flags[@]}" -czf - -C "$PI_FILES" . | ssh "${SSH_OPTS[@]}" "$PI" \
       "sudo date -u -s @$(date +%s) >/dev/null; rm -rf /tmp/ftc-pi-update && mkdir /tmp/ftc-pi-update &&
        tar -xzf - -m --warning=no-unknown-keyword -C /tmp/ftc-pi-update &&
        sudo bash /tmp/ftc-pi-update/install.sh $latest; rc=\$?; rm -rf /tmp/ftc-pi-update; exit \$rc" ||
@@ -422,7 +467,7 @@ PY
         esac
         while read -r size name; do
           # Already here with the same size: skip (a finished run never changes).
-          if [[ "$(stat -f%z "$dest/$name" 2>/dev/null)" != "$size" ]]; then
+          if [[ "$(file_size "$dest/$name" 2>/dev/null)" != "$size" ]]; then
             "$ADB" pull "$ROBOT_DATA/$name" "$dest/$name" >/dev/null || die "couldn't copy $name"
           fi
           echo "$dest/$name"
@@ -518,7 +563,7 @@ PY
         LC=$!
         while kill -0 "$LC" 2>/dev/null; do
           sleep 5 & wait $!  # (waiting this way lets Ctrl-C / quit stop it right away)
-          if (( $(stat -f%z "$ROBOT_LOG" 2>/dev/null || echo 0) > 20000000 )); then
+          if (( $(file_size "$ROBOT_LOG" 2>/dev/null || echo 0) > 20000000 )); then
             kill "$LC" 2>/dev/null || true; mv "$ROBOT_LOG" "$ROBOT_LOG.1"
           fi
         done
@@ -536,7 +581,7 @@ PY
       "$ADB" forward "tcp:$p" "tcp:$p" >/dev/null || die "port $p is busy on this Mac (close whatever uses it)"
     done
     echo "Panels: http://localhost:8001"
-    [[ "${2:-}" == "--no-open" ]] || open "http://localhost:8001"
+    [[ "${2:-}" == "--no-open" ]] || open_url "http://localhost:8001"
     ;;
   tuning)
     if [[ "${2:-}" == "--stop" ]]; then
@@ -548,7 +593,7 @@ PY
       "$ADB" forward "tcp:$p" "tcp:$p" >/dev/null || die "port $p is busy on this Mac (close whatever uses it)"
     done
     echo "Pedro tuning: http://localhost:10158 (needs Pedro's tuning library in the robot's code; the robot drives itself, give it room)"
-    [[ "${2:-}" == "--no-open" ]] || open "http://localhost:10158"
+    [[ "${2:-}" == "--no-open" ]] || open_url "http://localhost:10158"
     ;;
   adb)
     shift
