@@ -71,7 +71,7 @@ Linux uses Connor's existing Pi firmware and `ftc-bridge` Bash CLI, with Linux-s
 
 1. Prepare the SD card using the existing macOS `flash.sh`.
 2. From the repository root on Linux, run `bash linux/install.sh`.
-3. Connect the Pi through its USB data port and make sure the Linux USB Ethernet interface gets an automatic (DHCP) address on `10.12.194.0/24`.
+3. Connect the Pi through its USB data port and make sure the Linux USB Ethernet interface receives an address in `10.12.194.0/24` via DHCP.
 4. Authorize the Linux machine's `ftc-bridge key` on the Pi using a computer that already has access.
 5. Use `ftc-bridge health` to verify connectivity.
 
