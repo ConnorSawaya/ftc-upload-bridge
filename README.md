@@ -148,7 +148,7 @@ ftc-bridge use NAME             switch to that robot
 ftc-bridge forget NAME          delete a saved robot
 ftc-bridge disconnect           take the Pi off the robot's Wi-Fi
 ftc-bridge reboot | shutdown    restart or shut down the Pi
-ftc-bridge update-pi            update the Pi's software from this Mac
+ftc-bridge update-pi            update the Pi's software from this computer
 ftc-bridge pi-log               how the Pi's last run ended (shows what it was doing if it froze), and how often the USB link went dead
 ftc-bridge key                  this computer's public key
 ftc-bridge add-key "KEY"        let another computer (e.g. a teammate's PC) use the Pi
